@@ -1,0 +1,22 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.streamlit/secrets.toml
+
+# Local AI data — never push models or personal indexes
+memory/
+*.gguf
+*.bin
+.ollama/
+.copilot_exports/
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

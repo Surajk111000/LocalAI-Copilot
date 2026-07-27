@@ -1,0 +1,23 @@
+ollama:
+  base_url: "http://localhost:11434"
+  # Start with 3b if 7b is slow on a 4GB GPU
+  model: "qwen2.5-coder:3b"
+  embed_model: "nomic-embed-text"
+  temperature: 0.2
+  num_predict: 2048
+  # Optional default; UI slider overrides this with a safe range
+  # num_thread: 3
+
+rag:
+  chunk_size: 1200
+  overlap: 200
+  top_k: 5
+  batch_size: 16
+
+tools:
+  enabled_by_default: false
+  max_agent_steps: 3
+
+ui:
+  title: "Local AI Coding Copilot"
+  page_icon: "💻"
