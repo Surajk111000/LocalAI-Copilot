@@ -5,48 +5,26 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from src.agent.plan_types import EditPlan
 from src.editing.apply import ProposedEdit, build_proposed_edit
 from src.llm.ollama_client import OllamaClient, OllamaError
 from src.project_overview import build_project_overview
 from src.tools.filesystem import FileSystemTools
-from src.workspace.paths import plans_dir, read_json, write_json
+from src.workspace.paths import project_dir, read_json, write_json
+
+try:
+    from src.workspace.paths import plans_dir
+except ImportError:  # pragma: no cover — stale Streamlit module cache
+
+    def plans_dir(project_path: str | Path) -> Path:
+        path = project_dir(project_path) / "plans"
+        path.mkdir(parents=True, exist_ok=True)
+        return path
 
 PLAN_RE = re.compile(r"\{[\s\S]*\}")
-
-
-@dataclass
-class EditPlan:
-    id: str
-    goal: str
-    summary: str
-    analysis: str
-    files_to_modify: list[str] = field(default_factory=list)
-    files_to_create: list[str] = field(default_factory=list)
-    steps: list[str] = field(default_factory=list)
-    status: str = "awaiting_approval"  # awaiting_approval | approved | rejected | generating | ready
-    notes: str = ""
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "EditPlan":
-        return cls(
-            id=str(data.get("id") or uuid.uuid4().hex[:12]),
-            goal=str(data.get("goal") or ""),
-            summary=str(data.get("summary") or ""),
-            analysis=str(data.get("analysis") or ""),
-            files_to_modify=list(data.get("files_to_modify") or []),
-            files_to_create=list(data.get("files_to_create") or []),
-            steps=list(data.get("steps") or []),
-            status=str(data.get("status") or "awaiting_approval"),
-            notes=str(data.get("notes") or ""),
-        )
-
 
 PLAN_SYSTEM = """You are a careful local coding agent planner.
 You NEVER modify files. You only produce an execution plan as JSON.
@@ -133,7 +111,6 @@ class AgentPlanner:
             data = {}
 
         if not data:
-            # Deterministic fallback plan for offline / parse failures
             data = {
                 "summary": f"Implement: {goal}",
                 "analysis": overview.context[:1500],

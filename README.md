@@ -1,186 +1,281 @@
 # Local AI Coding Copilot
 
-A **local-first** AI coding assistant. You type a command in a Streamlit UI; a model running on your laptop (via [Ollama](https://ollama.com)) writes the code.
+A **local-first** AI coding assistant — like Cursor / Copilot, but everything runs on your laptop via [Ollama](https://ollama.com). No cloud API keys. You ask in chat; the app proposes **diffs**; you **Accept** or **Reject** before anything is written to disk.
 
-No cloud API keys. No deployment. Push this repo to GitHub to show the engineering — run it on your machine.
+![App overview](docs/screenshots/01-overview.png)
 
-## Features
+**Repo:** https://github.com/Surajk111000/LocalAI-Copilot
 
-### Phase 1 — Local coding chat
-- Chat UI built with Streamlit
-- Local LLM via Ollama (`qwen2.5-coder:3b` by default — friendly to 4GB VRAM)
-- Coding-focused system prompt (command → code)
-- Streaming responses
-- Model picker + connection status in the sidebar
+---
 
-### Phase 2 — Project memory (RAG)
-- Index a local project folder
-- Embeddings via `nomic-embed-text` (Ollama)
-- Vector store: ChromaDB (stored under `memory/`, gitignored)
-- Answers cite which files were used
+## Table of contents
 
-### Phase 3 — Filesystem tools
-- Agent can `list_directory`, `read_file`, `search_files`
-- `write_file` proposes changes — **you approve before anything is saved**
-- Paths are sandboxed to the selected project folder
+- [Clone this project](#clone-this-project)
+- [Quick start](#quick-start)
+- [Features (with screenshots)](#features-with-screenshots)
+- [Architecture](#architecture)
+- [Example commands](#example-commands)
+- [Project layout](#project-layout)
+- [Docs](#docs)
+- [License](#license)
 
-### Phase 4 — Multi-workspace
-- Open/switch multiple projects, explorer, context manager, chat sessions, per-project memory
+---
 
-### Phase 5 — Cursor-style editing
-- Chat vs Agent modes, plan → diff → accept, version history + undo
-- Smart search, symbols, rename, inline AI, review/tests/docs/commit assistants
+## Clone this project
 
-### Phase 7 — Productivity suite (Cursor / Windsurf / Cline inspired)
-- Prompt library + custom AI personas
-- Project `.rules/` conventions
-- Terminal assistant (generate → approve → run)
-- Git integration (status/diff/branch/commit/push/pull + commit messages)
-- TODO/FIXME/BUG/HACK scanner + traceback Error Assistant
-- Session memory, AI dashboard, developer logs
-- Settings: temperature, top_p, context size, threads, streaming, theme
-- Plugin API, chat export (Markdown/JSON/HTML-PDF), keyboard shortcut map
-- Performance: TTL cache, background indexing
-- Docs: Architecture, Installation, Developer, Contributing, MIT License
+### Prerequisites
 
-## Architecture
+- **Git**
+- **Python 3.10+**
+- **[Ollama](https://ollama.com)** installed and running
+- ~8–16 GB RAM (16 GB recommended)
+- Optional: NVIDIA GPU (GTX 1050 4GB works with `qwen2.5-coder:3b`)
 
-```text
-You → Streamlit UI
-        ├── Chat mode (fast Q&A)
-        └── Agent mode → LangGraph multi-agent
-              Planner → Research → Analyzer → Coder
-                → Reviewer → Tester → Docs → Final
-              (interrupt after Planner for approval)
-              Tools: filesystem | git | terminal | RAG
-              Diff Accept/Reject → Version history / Undo
-              memory/projects/<id>/…
+### 1. Clone the repository
+
+```bash
+git clone https://github.com/Surajk111000/LocalAI-Copilot.git
+cd LocalAI-Copilot
 ```
 
-## Documentation
+### 2. Create a virtual environment and install deps
 
-- [Architecture](docs/ARCHITECTURE.md)
-- [Installation](docs/INSTALLATION.md)
-- [Developer guide](docs/DEVELOPER.md)
-- [Contributing](CONTRIBUTING.md)
-- [License (MIT)](LICENSE)
+**Windows (PowerShell):**
 
-- Python 3.10+
-- [Ollama](https://ollama.com) installed and running
-- ~8–16 GB RAM (16 GB recommended)
-- Optional: NVIDIA GPU (GTX 1050 4GB works with small/quantized models)
+```powershell
+python -m venv .venv
+.\.venv\Scripts\activate
+pip install -r requirements.txt
+```
 
-## Quick start
+**macOS / Linux:**
 
-### 1. Install Ollama
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+```
 
-Download from https://ollama.com and open the app.
-
-### 2. Pull a coding model
+### 3. Install Ollama models
 
 ```bash
 ollama pull qwen2.5-coder:3b
 ollama pull nomic-embed-text
 ```
 
-If coding feels fast enough later, try:
-
-```bash
-ollama pull qwen2.5-coder:7b
-```
-
-Then change `config/config.yaml` → `ollama.model` to `qwen2.5-coder:7b`.
-
-### 3. Install Python deps
-
-```bash
-cd Local-AI-Coding-Copilot
-python -m venv .venv
-
-# Windows
-.venv\Scripts\activate
-
-# macOS / Linux
-# source .venv/bin/activate
-
-pip install -r requirements.txt
-```
-
-### 4. Run the UI
+### 4. Run the app
 
 ```bash
 streamlit run ui/streamlit_app.py
 ```
 
-Open the URL Streamlit prints (usually http://localhost:8501).
+Open **http://localhost:8501** in your browser.
 
-### 5. Index a project (RAG)
+---
 
-In the sidebar:
-1. Paste a local folder path (for example this repo itself)
-2. Click **Index project**
-3. Keep **Use project context** on
-4. Ask: `Explain this project` or `Where is the Ollama client?`
+## Quick start (after clone)
 
-### 6. Use filesystem tools
+1. Open a project folder in the sidebar (or paste a path in **Project / file path**).
+2. Choose **Chat** (fast) or **Agent** (plan → approve → edit).
+3. Set **CPU usage** to **Eco** or **Low** if your laptop feels slow.
+4. Type a task, click **Send**.
+5. When edits appear, review the **diff** and click **Accept** (writes to disk) or **Reject**.
 
-1. Keep **Enable filesystem tools** on
-2. Ask: `List the project files` or `Read src/config.py and explain it`
-3. To create a file: `Create examples/hello.py with a hello function`
-4. Review the proposed file → **Approve write** or **Reject**
+---
+
+## Features (with screenshots)
+
+### 1. Multi-project workspace
+
+Open and switch between local folders. Recent projects stay one click away. Ollama connection status is shown in the sidebar.
+
+![Projects and modes](docs/screenshots/feature-projects-mode.png)
+
+**What you can do**
+
+- Open any local folder (e.g. `G:\Projects\my-app`)
+- Switch active project without restarting
+- Keep several projects listed at once
+
+---
+
+### 2. Chat mode — local coding assistant
+
+Ask coding questions and get runnable code from a local model (`qwen2.5-coder:3b` by default). Streaming replies. **Send** and **Stop** sit on one line under the chat.
+
+![Chat coding](docs/screenshots/feature-chat.png)
+
+**What you can do**
+
+- Generate functions, APIs, Dockerfiles, explanations
+- Paste a **file or folder path** so the AI works on *your* code
+- Use example command buttons for common tasks
+
+---
+
+### 3. Agent mode — plan → approve → edit
+
+LangGraph multi-agent pipeline:
+
+`Planner → Research → Analyzer → Coder → Reviewer → Tester → Docs → Final`
+
+The run **pauses after Planning** so you can Approve or Reject before more work continues. Nothing is written until you Accept diffs.
+
+---
+
+### 4. Execution panel (live stages)
+
+See agent progress: Planning, Searching, Reading files, Generating, Reviewing, Testing, Documentation, Completed — plus recent activity.
+
+![Execution panel](docs/screenshots/feature-execution.png)
+
+---
+
+### 5. Cursor-style diffs (Accept / Reject)
+
+When the assistant changes code, you get a **proposed edit** (diff). You review it, then:
+
+- **Accept** → write to disk (+ version history for undo)
+- **Reject** → discard
+
+Writes are **never** auto-applied.
+
+**Text replace assist:** prompts like  
+`G:\Projects\my-app change title from Suraj Kumar to Akash`  
+search the project and propose multi-file diffs for review.
+
+---
+
+### 6. CPU usage controls (laptop-friendly)
+
+Tune how hard Ollama uses the CPU so Windows + the UI stay responsive:
+
+| Preset | Effect |
+|--------|--------|
+| **Eco (1)** | Least CPU, smoothest UI |
+| **Low (2)** | Good if the laptop feels laggy |
+| **Balanced** | Default middle ground |
+| **Max safe** | Fastest answers, heavier CPU |
+
+Also includes **CPU safety**: auto-pause AI work if CPU/RAM spike too high, with Unlock in the sidebar.
+
+![Full UI including CPU controls](docs/screenshots/03-cpu-and-chat.png)
+
+---
+
+### 7. Project / file path tools
+
+Expand **Project / file path** to:
+
+- Paste a folder or single file
+- **Explain folder** / **Explain file**
+- **Set active project**
+
+Expand **Example commands** for one-click prompts (list files, create file, add endpoint, …).
+
+---
+
+### 8. Filesystem tools & RAG (optional)
+
+- **Tools:** list / read / search / propose writes (sandboxed to the project)
+- **RAG:** index a project with `nomic-embed-text` + ChromaDB under `memory/` (gitignored)
+- Answers can cite which files were used
+
+---
+
+### 9. Local-only by design
+
+| Stays on your PC | What GitHub hosts |
+|------------------|-------------------|
+| Ollama models | Source code + docs |
+| `memory/` indexes | Screenshots / README |
+| Your project files | Config examples |
+
+The app talks to `http://localhost:11434` only.
+
+---
+
+## Architecture
+
+```text
+You → Streamlit UI (localhost:8501)
+        ├── Chat mode (fast Q&A / file edits / replace assist)
+        └── Agent mode → LangGraph multi-agent
+              Planner → Research → Analyzer → Coder
+                → Reviewer → Tester → Docs → Final
+              (interrupt after Planner for approval)
+              Tools: filesystem | git | terminal | RAG
+              Diff Accept/Reject → disk write
+              memory/projects/<id>/…
+```
+
+---
 
 ## Example commands
 
-- `List the project files`
-- `Read src/config.py and explain it`
-- `Search for OllamaClient`
-- `Create examples/hello.py with a hello function`
-- `Explain this project`
+```text
+List the project files and explain the folder structure
+Read src/config.py and explain what each setting does
+Search for OllamaClient
+Create examples/hello.py with a hello_world() function
+Add a /health endpoint
+G:\Projects\my-app change title from Old Name to New Name
+Explain this project
+```
+
+---
 
 ## Project layout
 
 ```text
-Local-AI-Coding-Copilot/
+LocalAI-Copilot/
 ├── config/
-│   ├── config.yaml           # local settings (safe to edit)
-│   └── config.example.yaml   # template for GitHub
+│   ├── config.yaml
+│   └── config.example.yaml
+├── docs/
+│   ├── screenshots/          # README images
+│   ├── ARCHITECTURE.md
+│   ├── INSTALLATION.md
+│   └── DEVELOPER.md
 ├── src/
-│   ├── config.py
-│   ├── agents/
-│   │   └── tool_agent.py     # tool-calling loop
-│   ├── tools/
-│   │   └── filesystem.py     # list/read/search/write
-│   ├── llm/
-│   │   └── ollama_client.py  # talks to local Ollama
-│   └── rag/
-│       ├── chunker.py
-│       ├── embeddings.py
-│       ├── ingest.py
-│       ├── retriever.py
-│       └── store.py
+│   ├── agents/               # tool-calling agent
+│   ├── editing/              # diffs, replace assist
+│   ├── llm/                  # Ollama client
+│   ├── multi_agent/          # LangGraph pipeline
+│   ├── rag/                  # chunk / embed / retrieve
+│   ├── tools/                # filesystem, git, terminal
+│   └── workspace/            # projects, settings, paths
 ├── ui/
-│   └── streamlit_app.py
-├── memory/                   # local ChromaDB (gitignored)
+│   ├── streamlit_app.py      # main UI entry
+│   └── components/
+├── tests/
 ├── requirements.txt
 └── README.md
 ```
 
-## Local-only by design
+---
 
-- Models live inside Ollama on your PC (not in this git repo)
-- The app calls `http://localhost:11434` only
-- Indexed project data stays in `memory/` on your disk
-- GitHub hosts **source code + docs**, not your model weights or personal indexes
+## Docs
 
-## Roadmap
+- [Architecture](docs/ARCHITECTURE.md)
+- [Installation](docs/INSTALLATION.md)
+- [Developer guide](docs/DEVELOPER.md)
+- [Contributing](CONTRIBUTING.md)
 
-- [x] Local coding chat (Ollama + Streamlit)
-- [x] RAG over a project folder (ChromaDB + embeddings)
-- [x] File read/write tools (with approval)
-- [ ] Git + terminal tools
-- [ ] Multi-agent flow (planner → coder → reviewer) with LangGraph
-- [ ] Continue.dev / VS Code setup guide
+---
+
+## Troubleshooting
+
+| Problem | Fix |
+|--------|-----|
+| `Ollama is not running` | Start the Ollama app, then `ollama pull qwen2.5-coder:3b` |
+| UI feels laggy | Sidebar → **CPU usage** → **Eco** or **Low** |
+| AI paused / locked | Sidebar → **CPU safety** → **Unlock** |
+| Import errors after update | Restart Streamlit (Ctrl+C, then `streamlit run …` again) |
+| Edits not applied | Look for the **diff** panel and click **Accept** |
+
+---
 
 ## License
 
-MIT (add a LICENSE file when you publish).
+MIT — see [LICENSE](LICENSE).

@@ -46,8 +46,71 @@ def wants_read_file(prompt: str) -> bool:
     )
 
 
+def wants_code_edit(prompt: str) -> bool:
+    """True when the user wants to change existing code (not create a brand-new file)."""
+    text = (prompt or "").lower().strip()
+    phrases = (
+        "add a function",
+        "add function",
+        "add a method",
+        "add a class",
+        "add an endpoint",
+        "add endpoint",
+        "add a helper",
+        "implement ",
+        "refactor ",
+        "fix ",
+        "modify ",
+        "update the",
+        "update this",
+        "change the",
+        "change ",
+        "edit this",
+        "edit the",
+        "insert ",
+        "remove the",
+        "delete the",
+        "add jwt",
+        "add auth",
+        "add authentication",
+        "rename ",
+        "replace ",
+        "title of",
+        "tittle",
+        "website title",
+        "site title",
+    )
+    if any(p in text for p in phrases):
+        return True
+    # "from Suraj Kumar to Akash"
+    if re.search(r"(?i)\bfrom\b.+\bto\b", text):
+        return True
+    # e.g. "add validation to src/main.py"
+    if re.search(
+        r"(?i)\b(add|implement|update|modify|refactor|fix|change)\b.+\b(to|in|into)\b.+\.\w+",
+        text,
+    ):
+        return True
+    return False
+
+
 def wants_create_file(prompt: str) -> bool:
     text = (prompt or "").lower()
+    # "Add a function to main.py" is an edit, not a new-file create.
+    if wants_code_edit(prompt):
+        explicit_new = any(
+            t in text
+            for t in (
+                "create file",
+                "create a file",
+                "add a file",
+                "new file",
+                "make a file",
+                "create examples/",
+            )
+        )
+        if not explicit_new:
+            return False
     return any(
         t in text
         for t in (
@@ -61,7 +124,7 @@ def wants_create_file(prompt: str) -> bool:
         )
     ) or bool(
         re.search(
-            r"(?i)\b(create|write|add|generate)\b.+\.(py|md|txt|yaml|yml|json)\b",
+            r"(?i)\b(create|write|generate)\b.+\.(py|md|txt|yaml|yml|json)\b",
             text,
         )
     )

@@ -119,7 +119,7 @@ def _run_action(
 
     if action == "Explain":
         abs_path = str((Path(project_path) / selected).resolve())
-        st.session_state.explain_path_input = abs_path
+        st.session_state._pending_explain_path = abs_path
         st.session_state.explain_target_path = abs_path
         st.session_state.pending_prompt = "Explain this file"
         activity.add("file", f"Explain {selected}", selected)
@@ -135,7 +135,7 @@ def _run_action(
             st.error(result.message)
     elif action == "Open":
         abs_path = str((Path(project_path) / selected).resolve())
-        st.session_state.explain_path_input = abs_path
+        st.session_state._pending_explain_path = abs_path
         st.session_state.explain_target_path = abs_path
         result = read_file(project_path, selected)
         if result.ok:

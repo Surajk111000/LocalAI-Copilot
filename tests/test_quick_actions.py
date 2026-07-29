@@ -7,6 +7,7 @@ from src.quick_actions import (
     handle_list,
     handle_read,
     propose_write_from_answer,
+    wants_code_edit,
     wants_create_file,
     wants_list_files,
     wants_read_file,
@@ -19,6 +20,8 @@ def test_detectors_and_extract() -> None:
     assert wants_create_file(
         "Create examples/hello.py with a hello_world() function and a main block"
     )
+    assert not wants_create_file("Add a validate_email function to src/main.py")
+    assert wants_code_edit("Add a validate_email function to src/main.py")
     assert extract_file_path("Read src/config.py and explain") == "src/config.py"
 
 

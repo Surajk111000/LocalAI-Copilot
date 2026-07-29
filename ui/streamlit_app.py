@@ -10,6 +10,7 @@ Phases:
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -25,6 +26,12 @@ from src.code_search import extract_search_query, search_project, wants_code_sea
 from src.config import get_ollama_settings, get_rag_settings, load_config
 from src.context.manager import ContextManager
 from src.editing.apply import ProposedEdit, build_proposed_edit
+from src.editing.replace_assist import (
+    extract_abs_project_path,
+    extract_replace_pair,
+    propose_text_replacements,
+    wants_text_replace,
+)
 from src.llm.ollama_client import (
     OllamaClient,
     OllamaError,
@@ -42,6 +49,7 @@ from src.quick_actions import (
     handle_list,
     handle_read,
     propose_write_from_answer,
+    wants_code_edit,
     wants_create_file,
     wants_list_files,
     wants_read_file,
@@ -56,30 +64,25 @@ from ui.components.cpu_safety import enforce_cpu_safety, render_cpu_safety_panel
 from src.tools.filesystem import FileSystemTools, PendingWrite
 from src.workspace.activity import ActivityStore
 from src.workspace.manager import WorkspaceManager
-from src.workspace.settings import ProjectSettings
+from src.workspace.settings import ProjectSettings, SettingsStore
 from ui.components.activity import render_activity
 from ui.components.agent_toolbox import render_agent_toolbox
 from ui.components.chat_sessions import (
     persist_messages_to_session,
-    render_chat_sessions,
     sync_messages_from_session,
 )
-from ui.components.context_panel import render_context_panel
-from ui.components.diff_viewer import render_diff_viewer, render_version_history
+from ui.components.diff_viewer import render_diff_viewer
 from ui.components.execution_panel import (
     render_execution_panel,
     render_pending_tool_approvals,
 )
-from ui.components.explorer import render_explorer
 from ui.components.multi_agent_panel import (
     render_multi_agent_controls,
     start_multi_agent,
 )
 from ui.components.plan_viewer import render_plan_viewer
 from ui.components.sidebar_projects import render_project_manager
-from ui.components.productivity_hub import render_dashboard, render_productivity_hub
 from ui.components.theme import brand_header, inject_theme
-from ui.components.workspace_settings import render_workspace_settings
 from src.productivity.devlog import console
 from src.productivity.metrics import MetricsStore
 from src.productivity.personas import persona_system_prompt
@@ -89,6 +92,8 @@ from src.productivity.rules import load_project_rules
 def wants_agent_feature(prompt: str) -> bool:
     """Heuristic: user is asking the agent to implement/change code."""
     text = (prompt or "").lower().strip()
+    if wants_code_edit(text):
+        return True
     starters = (
         "add ",
         "implement ",
@@ -103,7 +108,15 @@ def wants_agent_feature(prompt: str) -> bool:
         "wire ",
         "integrate ",
     )
-    return any(text.startswith(s) for s in starters) or "authentication" in text
+    if any(text.startswith(s) for s in starters):
+        return True
+    # Soft match mid-sentence: "please add …", "can you implement …"
+    return bool(
+        re.search(
+            r"(?i)\b(please\s+)?(can you\s+)?(add|implement|create|build|refactor|fix|update|modify)\b",
+            text,
+        )
+    ) or "authentication" in text
 
 
 def overview_is_file_prompt(prompt: str) -> bool:
@@ -194,65 +207,78 @@ def get_embedder() -> OllamaEmbedder:
     )
 
 
-def render_resource_controls(*, show_slider: bool = True) -> int:
-    """Show CPU/RAM usage and optional CPU-thread slider for Ollama."""
-    info = get_system_resources()
+def render_resource_controls(*, project_path: str | None = None) -> int:
+    """Show RAM/CPU and a simple control to lower LLM CPU usage."""
+    info = get_system_resources(sample_cpu=False)
     st.markdown("---")
-    st.subheader("Hardware (safe limits)")
+    st.markdown("#### CPU usage")
+    st.caption(
+        "Lower = cooler laptop / smoother UI, but slower answers. "
+        "This only limits Ollama (the AI), not Windows."
+    )
+
+    # Prefer session choice, then saved project setting, then recommended
+    if "num_thread" not in st.session_state:
+        st.session_state.num_thread = clamp_threads(info.recommended_threads, info)
+    current = clamp_threads(int(st.session_state.num_thread), info)
+
+    # Friendly presets mapped into the safe thread range
+    eco = info.safe_min_threads
+    low = clamp_threads(max(eco, min(2, info.safe_max_threads)), info)
+    balanced = clamp_threads(info.recommended_threads, info)
+    max_safe = info.safe_max_threads
+
+    preset_labels = {
+        eco: f"Eco ({eco} thread) — least CPU",
+        low: f"Low ({low}) — recommended if UI feels laggy",
+        balanced: f"Balanced ({balanced})",
+        max_safe: f"Max safe ({max_safe}) — fastest, heaviest CPU",
+    }
+    # Deduplicate if safe_max is small (e.g. only 1–2 threads)
+    unique_values: list[int] = []
+    for value in (eco, low, balanced, max_safe):
+        if value not in unique_values:
+            unique_values.append(value)
+
+    # Pick closest preset for the radio index
+    if current not in unique_values:
+        current = min(unique_values, key=lambda v: abs(v - current))
+        st.session_state.num_thread = current
+
+    choice = st.radio(
+        "How hard should the AI use the CPU?",
+        options=unique_values,
+        index=unique_values.index(current),
+        format_func=lambda n: preset_labels.get(n, f"{n} threads"),
+        label_visibility="collapsed",
+        help="Eco/Low keep the UI smoother. Max safe answers faster but can lag the laptop.",
+    )
+    num_thread = clamp_threads(int(choice), info)
+    st.session_state.num_thread = num_thread
+
+    # Persist for this project
+    if project_path:
+        try:
+            SettingsStore(project_path).update(cpu_threads=num_thread)
+        except Exception:
+            pass
 
     st.markdown(
         f"**CPU:** {info.physical_cores} cores / {info.logical_cores} threads  \n"
         f"**RAM:** {info.ram_used_gb} / {info.ram_total_gb} GB used "
-        f"({info.ram_percent}%)  \n"
-        f"**Free RAM:** {info.ram_available_gb} GB"
+        f"({info.ram_percent}%) · free **{info.ram_available_gb} GB**"
     )
-
     if info.ollama_rss_gb is not None:
-        st.markdown(f"**Ollama RAM now:** ~{info.ollama_rss_gb} GB")
-    else:
-        st.caption("Ollama process memory: not detected yet")
-
+        st.caption(f"Ollama RAM now: ~{info.ollama_rss_gb} GB")
     st.progress(min(info.ram_percent / 100.0, 1.0))
 
-    if not show_slider:
-        current = clamp_threads(
-            int(st.session_state.get("num_thread", info.recommended_threads)),
-            info,
-        )
-        st.caption(
-            f"Threads controlled in Workspace settings "
-            f"(now {current}; safe {info.safe_min_threads}–{info.safe_max_threads})."
-        )
-        if info.ram_available_gb < 2.5:
-            st.warning("Low free RAM (< 2.5 GB). Close other apps before generating.")
-        return current
+    if num_thread <= low:
+        st.success(f"CPU saver on — AI uses **{num_thread}** thread(s).")
+    else:
+        st.info(f"AI will use **{num_thread}** CPU thread(s) while generating.")
 
-    default_threads = st.session_state.get(
-        "num_thread", info.recommended_threads
-    )
-    default_threads = clamp_threads(int(default_threads), info)
-
-    num_thread = st.slider(
-        "CPU threads for LLM",
-        min_value=info.safe_min_threads,
-        max_value=info.safe_max_threads,
-        value=default_threads,
-        help=(
-            "Safe range only: leaves CPU free for Windows + this UI. "
-            "Higher = often faster generation, but the laptop may stutter."
-        ),
-    )
-    st.session_state.num_thread = int(num_thread)
-
-    st.caption(
-        f"Safe range: {info.safe_min_threads}–{info.safe_max_threads} "
-        f"(recommended {info.recommended_threads}). "
-        "Max is capped so one core stays free."
-    )
     if info.ram_available_gb < 2.5:
-        st.warning(
-            "Low free RAM (< 2.5 GB). Close other apps before generating."
-        )
+        st.warning("Low free RAM (< 2.5 GB). Close other apps before generating.")
     return int(num_thread)
 
 
@@ -266,12 +292,10 @@ def sidebar(
 
     available = False
     chat_models: list[str] = []
-    embed_models: list[str] = []
     try:
         available = client.is_available()
         if available:
             chat_models = client.list_chat_models()
-            embed_models = client.list_embed_models()
     except OllamaError:
         available = False
 
@@ -313,80 +337,58 @@ def sidebar(
                 "Nothing is written without your approval."
             ),
         )
-        st.session_state.copilot_mode = mode
         if is_agent_mode(mode):
             st.caption("Agent mode: LangGraph multi-agent (plan → research → code → review → test → docs).")
         else:
             st.caption("Chat mode: fast conversation / explain / search.")
 
-        st.markdown("---")
-        with st.expander("Explorer", expanded=True):
-            render_explorer(project_path)
+        # Quiet defaults — no Explorer / Sessions / Settings / Dashboard / Productivity panels
+        if project_path:
+            project_settings = SettingsStore(project_path).load()
+            session_store = SessionStore(project_path)
+            session_store.ensure_active()
+        else:
+            project_settings = ProjectSettings(preferred_model=default_model)
+            session_store = None
 
         st.markdown("---")
-        with st.expander("Chat sessions", expanded=True):
-            session_store = render_chat_sessions(project_path)
-
-        st.markdown("---")
-        with st.expander("Workspace settings", expanded=False):
-            if not chat_models:
-                options = (
-                    [default_model]
-                    if is_chat_model(default_model)
-                    else ["qwen2.5-coder:3b"]
-                )
-            else:
-                options = chat_models
-            project_settings = render_workspace_settings(
-                project_path, options, default_model
+        st.markdown("#### Model")
+        if not chat_models:
+            options = (
+                [default_model]
+                if is_chat_model(default_model)
+                else ["qwen2.5-coder:3b"]
             )
-            inject_theme(project_settings.theme)
-
-        st.markdown("---")
-        with st.expander("AI Dashboard", expanded=False):
-            render_dashboard(project_path)
-
-        st.markdown("---")
-        with st.expander("Productivity", expanded=False):
-            # Client for toolbox will be recreated in main; use probe for generation helpers
-            render_productivity_hub(project_path, client)
+        else:
+            options = chat_models
+        preferred = project_settings.preferred_model
+        if preferred not in options:
+            preferred = default_model if default_model in options else options[0]
+        selected = st.selectbox(
+            "Chat model",
+            options=options,
+            index=options.index(preferred),
+            key="sidebar_chat_model",
+            label_visibility="collapsed",
+        )
+        inject_theme(project_settings.theme or st.session_state.get("ui_theme", "dark"))
 
         # Sync toggles from per-project settings (source of truth)
-        selected = project_settings.preferred_model
         use_rag = bool(project_settings.rag_enabled)
         use_tools = bool(project_settings.filesystem_enabled)
-        num_thread = int(project_settings.cpu_threads)
         temperature = float(project_settings.temperature)
         st.session_state.use_rag = use_rag
         st.session_state.use_tools = use_tools
-        st.session_state.num_thread = num_thread
         st.session_state.persona_id = project_settings.persona_id
         st.session_state.ui_theme = project_settings.theme
         st.session_state.project_path = project_path or st.session_state.get(
             "project_path", ""
         )
+        # Seed threads once from project settings (do not overwrite user choice each run)
+        if "num_thread" not in st.session_state:
+            st.session_state.num_thread = int(project_settings.cpu_threads)
 
-        st.markdown("---")
-        st.subheader("Project memory (RAG)")
-        if embed_models:
-            st.success(f"Embed model ready: `{embed_models[0]}`")
-        else:
-            st.warning("No embed model. Run: `ollama pull nomic-embed-text`")
-
-        if st.button("Index project", use_container_width=True, type="primary"):
-            _run_indexing(project_path or "")
-
-        if project_path:
-            try:
-                retriever = ProjectRetriever(get_embedder())
-                if retriever.has_index(project_path):
-                    st.info("Index found for this folder")
-                else:
-                    st.warning("Not indexed yet — click Index project")
-            except Exception:
-                st.caption("Index status unavailable until Ollama is running.")
-
-        render_resource_controls(show_slider=False)
+        num_thread = render_resource_controls(project_path=project_path)
         render_cpu_safety_panel()
 
         st.markdown("---")
@@ -395,13 +397,6 @@ def sidebar(
             st.session_state.pending_writes = []
             if session_store:
                 persist_messages_to_session(session_store)
-            st.rerun()
-
-        if st.button("⏹ Stop generation", use_container_width=True, type="secondary"):
-            st.session_state.stop_generation = True
-            st.session_state.pending_prompt = None
-            st.session_state.pop("_quick_effective_prompt", None)
-            st.warning("Stop requested — generation will cancel.")
             st.rerun()
 
         st.caption(
@@ -560,20 +555,7 @@ def render_chat(
         with st.container(border=True):
             render_execution_panel()
         with st.container(border=True):
-            render_context_panel(project_path)
-        with st.container(border=True):
-            render_version_history(project_path)
-        with st.container(border=True):
             render_activity(project_path)
-        preview = st.session_state.get("explorer_preview")
-        if preview and st.session_state.get("explorer_preview_path"):
-            with st.container(border=True):
-                st.markdown("#### Preview")
-                st.caption(st.session_state.explorer_preview_path)
-                st.code(
-                    preview[:6000],
-                    language=_guess_lang(st.session_state.explorer_preview_path),
-                )
 
     with main_col:
         if is_agent_mode(mode):
@@ -587,6 +569,51 @@ def render_chat(
             session_store,
             project_settings,
         )
+
+
+def _is_noise_chat_message(message: dict) -> bool:
+    """Hide CPU-safety spam and empty system notes from the transcript."""
+    text = str(message.get("content") or "")
+    noise = (
+        "Blocked by CPU safety",
+        "Generation stopped by CPU safety",
+        "CPU safety stop",
+        "CPU safety lock is active",
+    )
+    return any(n in text for n in noise)
+
+
+def _render_chat_input_bar() -> None:
+    """Always render Send/Stop at the bottom of the chat column."""
+    st.markdown("")  # spacer
+    input_col, stop_col = st.columns([8.2, 1.35], gap="small")
+    with input_col:
+        with st.form("main_chat_bar", clear_on_submit=True, border=False):
+            typed_col, send_col = st.columns([7.2, 1.15], gap="small")
+            typed = typed_col.text_input(
+                "chat_cmd",
+                placeholder="Type a coding command or project question…",
+                label_visibility="collapsed",
+            )
+            sent = send_col.form_submit_button(
+                "Send", type="primary", use_container_width=True
+            )
+            if sent and (typed or "").strip():
+                st.session_state._chat_submit = (typed or "").strip()
+                st.rerun()
+    with stop_col:
+        if st.button(
+            "⏹ Stop",
+            type="secondary",
+            use_container_width=True,
+            key="main_stop_btn",
+            help="Stop the current generation",
+        ):
+            st.session_state.stop_generation = True
+            st.session_state.pending_prompt = None
+            st.session_state.pop("_chat_submit", None)
+            st.session_state.pop("_quick_effective_prompt", None)
+            st.rerun()
 
 
 def _render_chat_main(
@@ -604,147 +631,191 @@ def _render_chat_main(
     if not st.session_state.get("multi_agent_snapshot"):
         render_plan_viewer(project_path, client)
 
+    # One banner only — never spam the chat transcript
+    if st.session_state.get("cpu_safety_lock"):
+        st.warning(
+            "AI paused (CPU/RAM safety). Unlock under **CPU safety** in the sidebar, "
+            "or pick **Eco / Low** CPU usage."
+        )
+
     mode = st.session_state.get("copilot_mode", CopilotMode.CHAT.value)
     if is_agent_mode(mode):
-        st.markdown("### LangGraph multi-agent workflow")
+        st.markdown("### Agent mode")
         st.caption(
-            "Ask for a feature (e.g. **Add JWT authentication**). "
-            "Pipeline: Planner → Research → Analyzer → Coder → Reviewer → Tester → Docs → Final. "
-            "Paused after Planning for your approval. **Nothing is written without Accept on diffs.**"
+            "Ask for a change (e.g. **Add JWT authentication**). "
+            "Approve the plan, then Accept diffs — nothing writes without your review."
         )
     else:
-        st.markdown("### Explain any local folder or file")
+        st.markdown("### Chat")
         st.caption(
-            "Copy-paste any local path below (folder **or** single file). "
-            "Example folder: `G:\\Projects\\my-app` — "
-            "Example file: `G:\\Projects\\my-app\\src\\main.py`"
+            "Paste a project path if needed, then ask in the box below. "
+            "Edits show as diffs to **Accept** / **Reject**."
         )
 
     # Remember recent paths so switching projects is easy
     if "recent_explain_paths" not in st.session_state:
         st.session_state.recent_explain_paths = []
-    if "explain_path_input" not in st.session_state:
+    pending_path = st.session_state.pop("_pending_explain_path", None)
+    if pending_path is not None:
+        st.session_state.explain_path_input = str(pending_path)
+    elif "explain_path_input" not in st.session_state:
         st.session_state.explain_path_input = (
             st.session_state.get("explain_target_path")
             or project_path
             or ""
         )
 
-    explain_path = st.text_input(
-        "Local path to explain (paste folder or file)",
-        placeholder=r"G:\Projects\some-other-app   or   G:\Projects\app\src\main.py",
-        key="explain_path_input",
-    ).strip().strip('"').strip("'")
-    st.session_state.explain_target_path = explain_path
+    with st.expander("Project / file path", expanded=False):
+        explain_path = st.text_input(
+            "Local file or folder for the AI (paste a path)",
+            placeholder=r"G:\Projects\my-app   or   G:\Projects\my-app\src\main.py",
+            key="explain_path_input",
+            help="Folder or file the AI should work on.",
+        ).strip().strip('"').strip("'")
+        st.session_state.explain_target_path = explain_path
 
-    # Keep sidebar project path in sync when user pastes a folder
-    if explain_path:
-        p = Path(explain_path)
-        if p.exists() and p.is_dir():
-            st.session_state.project_path = explain_path
-            try:
-                WorkspaceManager().open_project(explain_path)
-            except Exception:
-                pass
-
-    recent = [p for p in st.session_state.recent_explain_paths if p != explain_path]
-    if recent:
-        picked = st.selectbox(
-            "Or pick a recent path",
-            options=["(choose a recent path)"] + recent,
-            index=0,
-            key="recent_path_picker",
-        )
-        if picked != "(choose a recent path)" and st.button(
-            "Load selected recent path", use_container_width=True
-        ):
-            st.session_state.explain_path_input = picked
-            st.session_state.explain_target_path = picked
-            if Path(picked).is_dir():
-                st.session_state.project_path = picked
-            elif Path(picked).is_file():
-                st.session_state.project_path = str(Path(picked).parent)
-            st.rerun()
-
-    btn_cols = st.columns(3)
-    with btn_cols[0]:
-        if st.button(
-            "Explain this folder/project",
-            use_container_width=True,
-            type="primary",
-            disabled=not bool(explain_path),
-        ):
-            # Always explain the folder (if user pasted a file, use its parent)
+        if explain_path:
             p = Path(explain_path)
-            folder = str(p.parent if p.is_file() else p)
-            st.session_state.explain_path_input = folder
-            st.session_state.explain_target_path = folder
-            st.session_state.project_path = folder
-            st.session_state.force_explain_folder = True
-            _remember_path(folder)
-            st.session_state.pending_prompt = (
-                "Explain this entire project folder: structure, pages, components, and how to run it"
+            if p.exists() and p.is_dir():
+                st.session_state.project_path = explain_path
+                try:
+                    WorkspaceManager().open_project(explain_path)
+                except Exception:
+                    pass
+            elif p.exists() and p.is_file():
+                folder = str(p.parent)
+                st.session_state.project_path = folder
+                try:
+                    WorkspaceManager().open_project(folder)
+                    ContextManager(folder).add(str(p), pinned=True)
+                except Exception:
+                    pass
+
+        recent = [p for p in st.session_state.recent_explain_paths if p != explain_path]
+        if recent:
+            picked = st.selectbox(
+                "Recent paths",
+                options=["(choose)"] + recent,
+                index=0,
+                key="recent_path_picker",
             )
-    with btn_cols[1]:
-        if st.button(
-            "Explain this file/code",
-            use_container_width=True,
-            disabled=not bool(explain_path),
+            if picked != "(choose)" and st.button(
+                "Load path", use_container_width=True, key="load_recent_path"
+            ):
+                st.session_state._pending_explain_path = picked
+                st.session_state.explain_target_path = picked
+                if Path(picked).is_dir():
+                    st.session_state.project_path = picked
+                elif Path(picked).is_file():
+                    st.session_state.project_path = str(Path(picked).parent)
+                st.rerun()
+
+        btn_cols = st.columns(3)
+        with btn_cols[0]:
+            if st.button(
+                "Explain folder",
+                use_container_width=True,
+                type="primary",
+                disabled=not bool(explain_path),
+                key="btn_explain_folder",
+            ):
+                p = Path(explain_path)
+                folder = str(p.parent if p.is_file() else p)
+                st.session_state._pending_explain_path = folder
+                st.session_state.explain_target_path = folder
+                st.session_state.project_path = folder
+                st.session_state.force_explain_folder = True
+                _remember_path(folder)
+                st.session_state.pending_prompt = (
+                    "Explain this entire project folder: structure, pages, "
+                    "components, and how to run it"
+                )
+                st.rerun()
+        with btn_cols[1]:
+            if st.button(
+                "Explain file",
+                use_container_width=True,
+                disabled=not bool(explain_path),
+                key="btn_explain_file",
+            ):
+                st.session_state.force_explain_folder = False
+                _remember_path(explain_path)
+                st.session_state.pending_prompt = "Explain this file"
+                st.rerun()
+        with btn_cols[2]:
+            if st.button(
+                "Set active project",
+                use_container_width=True,
+                disabled=not bool(explain_path),
+                key="btn_set_active_project",
+            ):
+                p = Path(explain_path)
+                folder = str(p.parent) if p.exists() and p.is_file() else explain_path
+                st.session_state.project_path = folder
+                try:
+                    WorkspaceManager().open_project(folder)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(str(exc))
+                _remember_path(explain_path)
+                st.rerun()
+
+    with st.expander("Example commands", expanded=False):
+        prompt_groups = {
+            "Project": [
+                "List the project files and explain the folder structure",
+                "Read src/config.py and explain what each setting does",
+                "Search for OllamaClient and tell me which files define or use it",
+            ],
+            "Edits": [
+                "Add JWT authentication",
+                "Add a /health endpoint",
+            ],
+            "Create": [
+                "Create examples/hello.py with a hello_world() function and a main block",
+            ],
+        }
+        for group_name, prompts in prompt_groups.items():
+            st.caption(group_name)
+            for example in prompts:
+                if st.button(example, use_container_width=True, key=f"ex_{hash(example)}"):
+                    st.session_state.pending_prompt = example
+                    st.rerun()
+
+    # Strip old CPU-safety spam from history once
+    if st.session_state.messages:
+        cleaned = [m for m in st.session_state.messages if not _is_noise_chat_message(m)]
+        if len(cleaned) != len(st.session_state.messages):
+            st.session_state.messages = cleaned
+
+    prompt = st.session_state.pop("_chat_submit", None)
+    if not prompt and "pending_prompt" in st.session_state:
+        prompt = st.session_state.pop("pending_prompt")
+
+    # Quiet stop — one transcript line max, no extra warning bubbles
+    if st.session_state.pop("stop_generation", False):
+        stop_text = (
+            "_⏹ Generation stopped._"
+            if not st.session_state.get("cpu_safety_lock")
+            else "_⏹ Stopped by CPU safety — unlock in the sidebar when ready._"
+        )
+        if (
+            not st.session_state.messages
+            or st.session_state.messages[-1].get("content") != stop_text
         ):
-            st.session_state.force_explain_folder = False
-            _remember_path(explain_path)
-            st.session_state.pending_prompt = "Explain this file"
-    with btn_cols[2]:
-        if st.button(
-            "Use as active project",
-            use_container_width=True,
-            disabled=not bool(explain_path),
-            help="Sets sidebar project path (for tools/RAG) to this folder.",
-        ):
-            p = Path(explain_path)
-            folder = str(p.parent) if p.exists() and p.is_file() else explain_path
-            st.session_state.project_path = folder
-            try:
-                WorkspaceManager().open_project(folder)
-            except Exception as exc:  # noqa: BLE001
-                st.error(str(exc))
-            _remember_path(explain_path)
-            st.success("Active project path updated.")
-            st.rerun()
-
-    st.markdown("**Try a command** (uses your active/pasted project path):")
-
-    prompt_groups = {
-        "Project": [
-            "List the project files and explain the folder structure",
-            "Read src/config.py and explain what each setting does",
-            "Search for OllamaClient and tell me which files define or use it",
-            "Where is login?",
-        ],
-        "Agent edits": [
-            "Add JWT authentication",
-            "Add a /health endpoint",
-            "Generate pytest tests for the main module",
-        ],
-        "Create / write": [
-            "Create examples/hello.py with a hello_world() function and a main block",
-            "Create examples/fastapi_hello.py with a FastAPI /health endpoint",
-        ],
-        "Code generation": [
-            "Write a FastAPI hello world app with / and /health endpoints",
-            "Write a Python function to reverse a linked list with docstring and example",
-            "Generate a Dockerfile for a Python FastAPI app using uvicorn",
-        ],
-    }
-
-    for group_name, prompts in prompt_groups.items():
-        st.caption(group_name)
-        cols = st.columns(len(prompts))
-        for col, example in zip(cols, prompts):
-            if col.button(example, use_container_width=True, key=f"ex_{hash(example)}"):
-                st.session_state.pending_prompt = example
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": stop_text,
+                    "sources": [],
+                    "tool_trace": [],
+                }
+            )
+            if session_store:
+                persist_messages_to_session(session_store)
 
     for message in st.session_state.messages:
+        if _is_noise_chat_message(message):
+            continue
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
             if message.get("sources"):
@@ -757,601 +828,729 @@ def _render_chat_main(
                             )
                         else:
                             st.markdown(f"- `{src['path']}`")
-            if message.get("tool_trace"):
+            if message.get("tool_trace") and message.get("tool_trace") != ["cpu_safety"]:
                 with st.expander("Tool calls"):
                     for line in message["tool_trace"]:
                         st.code(line, language="text")
 
-    prompt = st.chat_input("Type a coding command or project question…")
-    if "pending_prompt" in st.session_state:
-        prompt = st.session_state.pop("pending_prompt")
+    try:
+        if not prompt:
+            return
 
-    # Handle stop even when no new prompt (interrupted mid-generation)
-    if st.session_state.pop("stop_generation", False):
-        reason = (
-            "🛑 **CPU safety stop** — laptop load was too high. "
-            "Unlock from the sidebar when it cools down."
-            if st.session_state.get("cpu_safety_lock")
-            else "⏹ Generation stopped."
-        )
-        with st.chat_message("assistant"):
-            st.warning(reason)
-        stop_text = (
-            "_🛑 Generation stopped by CPU safety guard._"
-            if st.session_state.get("cpu_safety_lock")
-            else "_⏹ Generation stopped by user._"
-        )
-        if not st.session_state.messages or st.session_state.messages[-1].get("content") != stop_text:
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": stop_text,
-                    "sources": [],
-                    "tool_trace": [],
-                }
-            )
-        if session_store:
-            persist_messages_to_session(session_store)
-        return
-
-    if not prompt:
-        return
-
-    # Block new AI work when CPU/RAM safety lock is active
-    if not enforce_cpu_safety(during_generation=False):
-        with st.chat_message("assistant"):
-            st.error(
+        # Block new AI work when CPU/RAM safety lock is active (banner only)
+        if not enforce_cpu_safety(during_generation=False):
+            st.info(
                 st.session_state.get("cpu_safety_status", {}).get("message")
                 or "CPU safety lock is active. Unlock in the sidebar when load drops."
             )
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": "_🛑 Blocked by CPU safety — unlock in the sidebar when the laptop cools down._",
-                "sources": [],
-                "tool_trace": ["cpu_safety"],
-            }
+            return
+
+        if project_path:
+            ActivityStore(project_path).add("prompt", prompt)
+
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        history = [
+            {"role": m["role"], "content": m["content"]}
+            for m in st.session_state.messages[:-1]
+            if not _is_noise_chat_message(m)
+        ]
+
+        context = ""
+        sources: list[dict] = []
+        assist_edit_rel: str | None = None
+        explain_target = (
+            st.session_state.get("explain_target_path")
+            or project_path
+            or ""
+        ).strip()
+
+        # Path typed in chat (e.g. "G:\Projects\app change title…") counts too
+        path_from_prompt = extract_abs_project_path(prompt)
+        if path_from_prompt:
+            explain_target = path_from_prompt
+            st.session_state._pending_explain_path = path_from_prompt
+            st.session_state.explain_target_path = path_from_prompt
+
+        # Resolve pasted file → project folder for THIS request (session may lag one run)
+        explain_path_obj = Path(explain_target) if explain_target else None
+        if explain_path_obj and explain_path_obj.exists():
+            if explain_path_obj.is_file():
+                project_path = str(explain_path_obj.parent)
+                st.session_state.project_path = project_path
+                try:
+                    WorkspaceManager().open_project(project_path)
+                except Exception:
+                    pass
+            elif explain_path_obj.is_dir():
+                project_path = str(explain_path_obj)
+                st.session_state.project_path = project_path
+                try:
+                    WorkspaceManager().open_project(project_path)
+                except Exception:
+                    pass
+
+        search_root = project_path or (
+            explain_target if explain_target and Path(explain_target).is_dir() else ""
         )
-        if session_store:
-            persist_messages_to_session(session_store)
-        return
+        if not search_root and explain_path_obj and explain_path_obj.is_file():
+            search_root = str(explain_path_obj.parent)
 
-    if project_path:
-        ActivityStore(project_path).add("prompt", prompt)
-
-    st.session_state.messages.append({"role": "user", "content": prompt})
-    with st.chat_message("user"):
-        st.markdown(prompt)
-
-    history = [
-        {"role": m["role"], "content": m["content"]}
-        for m in st.session_state.messages[:-1]
-    ]
-
-    context = ""
-    sources: list[dict] = []
-    explain_target = (
-        st.session_state.get("explain_target_path")
-        or project_path
-        or ""
-    ).strip()
-    search_root = project_path or (
-        explain_target if explain_target and Path(explain_target).is_dir() else ""
-    )
-
-    # Inject pinned / context-manager files first
-    if project_path:
-        pinned_block = ContextManager(project_path).build_context_block()
-        if pinned_block:
-            context = pinned_block
-
-    # Agent mode: LangGraph multi-agent (pause after planner)
-    if is_agent_mode(mode) and wants_agent_feature(prompt) and not wants_project_explanation(prompt):
-        if not project_path:
-            with st.chat_message("assistant"):
-                st.error("Open a project first, then ask the agent to implement a change.")
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "**Error:** No project open for Agent mode.",
-                    "sources": [],
-                    "tool_trace": [],
-                }
-            )
-            if session_store:
-                persist_messages_to_session(session_store)
-            return
-        with st.chat_message("assistant"):
-            with st.spinner("LangGraph Planner agent running…"):
-                snap = start_multi_agent(client, project_path, prompt)
-            answer = (
-                f"**Multi-agent plan ready** (LangGraph interrupted after Planner)\n\n"
-                f"**Summary:** {snap.get('plan_summary')}\n\n"
-                f"**Tasks:**\n"
-                + ("\n".join(f"- {t}" for t in (snap.get("tasks") or [])) or "- (none)")
-                + "\n\n**Files to modify:**\n"
-                + ("\n".join(f"- `{p}`" for p in (snap.get("files_to_modify") or [])) or "- (none)")
-                + "\n\n**New files:**\n"
-                + ("\n".join(f"- `{p}`" for p in (snap.get("files_to_create") or [])) or "- (none)")
-                + "\n\nApprove in the panel above to continue "
-                "Research → Analyzer → Coder → Reviewer → Tester → Docs → Final.\n\n"
-                "**No files were modified.**"
-            )
-            st.markdown(answer)
-            ActivityStore(project_path).add("prompt", f"LangGraph plan: {prompt}")
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": answer,
-                "sources": [
-                    {"path": p}
-                    for p in list(snap.get("files_to_modify") or [])
-                    + list(snap.get("files_to_create") or [])
-                ],
-                "tool_trace": ["langgraph:planner"],
-            }
-        )
-        if session_store:
-            persist_messages_to_session(session_store)
-        st.rerun()
-        return
-
-    # Smart "Where is X?" search
-    if wants_smart_where(prompt) and project_path:
-        with st.chat_message("assistant"):
-            with st.spinner("Smart search…"):
-                result = smart_search(project_path, prompt)
-            answer = (
-                f"{result.summary}\n\n"
-                + ("**Symbols**\n" + "\n".join(f"- `{s}`" for s in result.symbols) + "\n\n" if result.symbols else "")
-                + ("**Hits**\n```\n" + "\n".join(result.hits[:30]) + "\n```" if result.hits else "_No content hits._")
-            )
-            st.markdown(answer)
-            ActivityStore(project_path).add("search", prompt)
-        st.session_state.messages.append(
-            {
-                "role": "assistant",
-                "content": answer,
-                "sources": [],
-                "tool_trace": ["smart_search"],
-            }
-        )
-        if session_store:
-            persist_messages_to_session(session_store)
-        return
-
-    # Auto-search the project for "Search for X" (no Tools toggle required)
-    if wants_code_search(prompt) and not wants_project_explanation(prompt):
-        if not search_root:
-            with st.chat_message("assistant"):
-                st.error(
-                    "Set a project folder path first (sidebar or Explain path box), "
-                    "then search again."
-                )
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "**Error:** No project folder set for search.",
-                    "sources": [],
-                    "tool_trace": [],
-                }
-            )
-            if session_store:
-                persist_messages_to_session(session_store)
-            return
-        try:
-            query = extract_search_query(prompt)
-            bundle = search_project(search_root, query)
-            context = ((context + "\n\n") if context else "") + bundle.context
-            sources = [{"path": p} for p in bundle.files_used]
-            ActivityStore(search_root).add("search", query)
-            st.info(
-                f"Searched `{search_root}` for `{bundle.query}` — "
-                f"{bundle.hit_count} hit line(s)"
-            )
-        except Exception as exc:
-            with st.chat_message("assistant"):
-                st.error(str(exc))
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"**Error:** {exc}",
-                    "sources": [],
-                    "tool_trace": [],
-                }
-            )
-            if session_store:
-                persist_messages_to_session(session_store)
-            return
-
-    # List / Read / Create against the project path (no Tools toggle required)
-    elif wants_list_files(prompt) or wants_read_file(prompt) or wants_create_file(prompt):
-        if not search_root:
-            with st.chat_message("assistant"):
-                st.error("Set/paste a project folder path first, then try again.")
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": "**Error:** No project folder set.",
-                    "sources": [],
-                    "tool_trace": [],
-                }
-            )
-            if session_store:
-                persist_messages_to_session(session_store)
-            return
-        try:
-            if wants_list_files(prompt):
-                action = handle_list(search_root)
-            elif wants_create_file(prompt):
-                action = handle_create_prepare(search_root, prompt)
-                st.session_state.pending_create_path = (
-                    extract_file_path(prompt) or "examples/hello.py"
-                )
-            else:
-                action = handle_read(search_root, prompt)
-            extra = action.context
-            context = ((context + "\n\n") if context else "") + extra
-            sources = [{"path": p} for p in (action.sources or [])]
-            if action.effective_prompt:
-                st.session_state._quick_effective_prompt = action.effective_prompt
-            if action.info:
-                st.info(action.info)
-        except Exception as exc:
-            with st.chat_message("assistant"):
-                st.error(str(exc))
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"**Error:** {exc}",
-                    "sources": [],
-                    "tool_trace": [],
-                }
-            )
-            if session_store:
-                persist_messages_to_session(session_store)
-            return
-
-    # Auto-read the pasted path for explain prompts
-    elif wants_project_explanation(prompt):
-        if not explain_target:
-            with st.chat_message("assistant"):
-                st.error(
-                    "Paste a local folder or file path in **Explain any local folder or file**, "
-                    r"for example `G:\Projects\my-app` or `G:\Projects\my-app\main.py`."
-                )
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": (
-                        "**Error:** No path set. Paste any local folder/file path, then click Explain."
-                    ),
-                    "sources": [],
-                    "tool_trace": [],
-                }
-            )
-            if session_store:
-                persist_messages_to_session(session_store)
-            return
-        try:
-            target = explain_target
-            force_folder = bool(st.session_state.pop("force_explain_folder", False))
-            # "Explain this project/folder" must always use a directory
-            prompt_l = prompt.lower()
-            if force_folder or "project" in prompt_l or "folder" in prompt_l or "structure" in prompt_l:
-                p = Path(target)
-                if p.is_file():
-                    target = str(p.parent)
-                overview = build_project_overview(target)
-            else:
-                overview = build_path_context(target)
-            extra = overview.context
-            context = ((context + "\n\n") if context else "") + extra
-            sources = [{"path": p} for p in overview.files_used]
-            kind_label = "file" if overview.kind == "file" else "folder"
-            st.info(
-                f"Reading local {kind_label}: `{overview.project_path}` "
-                f"({len(overview.files_used)} items in context)"
-            )
-            with st.expander("Context files loaded", expanded=True):
-                for src in overview.files_used:
-                    st.markdown(f"- `{src}`")
-            _remember_path(overview.project_path)
-            if project_path:
-                ActivityStore(project_path).add("file", f"Explain {overview.project_path}")
-        except FileNotFoundError as exc:
-            with st.chat_message("assistant"):
-                st.error(str(exc))
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"**Error:** {exc}",
-                    "sources": [],
-                    "tool_trace": [],
-                }
-            )
-            if session_store:
-                persist_messages_to_session(session_store)
-            return
-
-    elif use_rag and project_path:
-        try:
-            rag = get_rag_settings()
-            retriever = ProjectRetriever(get_embedder(), top_k=rag["top_k"])
-            if retriever.has_index(project_path):
-                chunks = retriever.retrieve(project_path, prompt)
-                rag_ctx = retriever.format_context(chunks)
-                context = ((context + "\n\n") if context else "") + rag_ctx
-                sources = [
-                    {
-                        "path": c.path,
-                        "start_line": c.start_line,
-                        "end_line": c.end_line,
-                    }
-                    for c in chunks
-                ]
-        except OllamaError as exc:
-            with st.chat_message("assistant"):
-                st.error(str(exc))
-            st.session_state.messages.append(
-                {
-                    "role": "assistant",
-                    "content": f"**Error:** {exc}",
-                    "sources": [],
-                    "tool_trace": [],
-                }
-            )
-            if session_store:
-                persist_messages_to_session(session_store)
-            return
-
-    effective_prompt = prompt
-    quick_prompt = st.session_state.pop("_quick_effective_prompt", None)
-    if quick_prompt:
-        effective_prompt = quick_prompt
-    elif wants_code_search(prompt) and context:
-        effective_prompt = (
-            "Using ONLY the SEARCH HITS provided, answer where the symbol/text appears.\n"
-            "List matching file paths and briefly what each hit is.\n"
-            "If there are no hits, say it was not found in the project.\n"
-            "Do NOT say you lack project context — search results are already provided."
-        )
-    elif wants_project_explanation(prompt) and context:
-        if overview_is_file_prompt(prompt):
-            effective_prompt = (
-                "Using ONLY the FILE CONTENTS provided, explain this code.\n"
-                "Cover: purpose, important functions/classes, inputs/outputs, and how it fits a project.\n"
-                "Cite the file path. Do NOT ask for more information."
-            )
-        else:
-            effective_prompt = (
-                "Using ONLY the PROJECT CONTEXT provided, explain the WHOLE project.\n"
-                "Do NOT write an answer that only explains package.json.\n"
-                "Required sections:\n"
-                "1) Overview — what the app is (e.g. React portfolio)\n"
-                "2) Folder structure — describe src/, pages/, components/, data/, configs\n"
-                "3) Important source files — App.jsx, main.jsx, each page/component briefly\n"
-                "4) Data & routing — how pages are connected\n"
-                "5) How to run — npm scripts from package.json (short)\n"
-                "Cite real paths. Keep package.json to a few bullets only."
-            )
-
-    # Optional custom system prompt from project settings is applied in build_messages
-
-    auto_fs = (
-        wants_list_files(prompt)
-        or wants_read_file(prompt)
-        or wants_create_file(prompt)
-        or wants_code_search(prompt)
-        or wants_project_explanation(prompt)
-    )
-
-    with st.chat_message("assistant"):
-        if sources:
-            with st.expander(
-                "Files used",
-                expanded=bool(wants_code_search(prompt) or wants_list_files(prompt) or wants_read_file(prompt)),
-            ):
-                for src in sources:
-                    if "start_line" in src:
-                        st.markdown(
-                            f"- `{src['path']}` "
-                            f"(lines {src['start_line']}-{src['end_line']})"
+        # Cursor-style: "change X to Y" / title rename → propose diffs (no advice essay)
+        if wants_text_replace(prompt) and search_root and Path(search_root).is_dir():
+            pair = extract_replace_pair(prompt)
+            if pair:
+                old_text, new_text = pair
+                with st.chat_message("assistant"):
+                    with st.spinner(f"Proposing `{old_text}` → `{new_text}`…"):
+                        plan = propose_text_replacements(search_root, old_text, new_text)
+                    if plan.edits:
+                        existing = st.session_state.get("proposed_edits") or []
+                        existing.extend(e.to_dict() for e in plan.edits)
+                        st.session_state.proposed_edits = existing
+                        st.session_state.proposed_edits_note = f"{old_text} → {new_text}"
+                        st.markdown(plan.summary)
+                        st.info(
+                            f"{len(plan.edits)} edit(s) ready — **Accept** or **Reject** above."
                         )
-                    else:
-                        st.markdown(f"- `{src['path']}`")
-
-        placeholder = st.empty()
-        tool_trace: list[str] = []
-        new_pending_writes = False
-        answer = ""
-
-        try:
-            run_tools = bool(
-                use_tools
-                and project_path
-                and prompt_needs_tools(prompt)
-                and not auto_fs
-            )
-            if use_tools and project_path and not run_tools and not auto_fs:
-                st.caption(
-                    "Fast chat mode (tools skipped for this prompt). "
-                    "Ask to list/read/create a file to use tools."
-                )
-
-            if run_tools:
-                st.caption(
-                    "Running tools… Click **⏹ Stop generation** in the sidebar "
-                    "or **Stop** (top-right) to cancel."
-                )
-                placeholder.markdown(
-                    '<span class="loading-pulse">Running tools…</span>',
-                    unsafe_allow_html=True,
-                )
-                agent = ToolAgent(client, FileSystemTools(project_path), max_steps=3)
-                result = agent.run(
-                    effective_prompt,
-                    history=history,
-                    context=context or None,
-                )
-                if result.error:
-                    answer = f"**Error:** {result.error}"
-                else:
-                    answer = result.answer or "(No answer produced.)"
-                tool_trace = result.tool_trace
-                if result.pending_writes:
-                    existing = st.session_state.get("proposed_edits") or []
-                    for pw in result.pending_writes:
-                        try:
-                            edit = build_proposed_edit(
-                                project_path,
-                                pw.path,
-                                pw.content,
-                                note="tool agent proposal",
-                            )
-                            existing.append(edit.to_dict())
-                        except Exception:
-                            existing.append(
-                                ProposedEdit(
-                                    path=pw.path,
-                                    new_content=pw.content,
-                                    old_content=getattr(pw, "old_content", "") or "",
-                                    is_new=pw.is_new,
-                                    absolute_path=pw.absolute_path,
-                                ).to_dict()
-                            )
-                    st.session_state.proposed_edits = existing
-                    st.session_state.pending_writes = []
-                    new_pending_writes = True
-                    if project_path:
-                        ActivityStore(project_path).add(
+                        ActivityStore(search_root).add(
                             "edit",
-                            f"Proposed {len(result.pending_writes)} write(s)",
+                            f"Proposed replace {old_text!r} → {new_text!r} ({len(plan.edits)} files)",
                         )
-                placeholder.markdown(answer)
-                if tool_trace:
-                    with st.expander("Tool calls", expanded=True):
-                        for line in tool_trace:
-                            st.code(line, language="text")
-                if result.pending_writes:
-                    st.info(
-                        f"{len(result.pending_writes)} write(s) pending — "
-                        "approve or reject in the panel above."
-                    )
-            else:
-                if use_tools and not project_path:
-                    st.warning("Set a project folder to use filesystem tools.")
-                st.caption(
-                    "Generating… Click **⏹ Stop generation** in the sidebar "
-                    "or **Stop** (top-right) to cancel."
+                        answer = plan.summary
+                    else:
+                        answer = (
+                            f"Could not find **`{old_text}`** in `{search_root}`.\n\n"
+                            "Check spelling, or paste a more specific file path."
+                        )
+                        st.warning(answer)
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": [{"path": e.path} for e in (plan.edits if pair else [])],
+                        "tool_trace": ["text_replace_assist"],
+                    }
                 )
-                messages = build_messages(
-                    effective_prompt,
-                    history=history,
-                    context=context or None,
-                    system_prompt=_effective_system_prompt(
-                        project_path, project_settings
-                    ),
-                )
-                use_stream = True
-                if project_settings is not None:
-                    use_stream = bool(project_settings.streaming)
-                import time as _time
+                if session_store:
+                    persist_messages_to_session(session_store)
+                if plan.edits:
+                    st.rerun()
+                return
 
-                t0 = _time.perf_counter()
-                if use_stream:
-                    collected: list[str] = []
-                    stream = client.chat(messages, stream=True)
-                    assert not isinstance(stream, str)
-                    stopped = False
-                    chunk_i = 0
-                    for chunk in stream:
-                        chunk_i += 1
-                        # Periodically re-check CPU so a runaway load can abort mid-stream
-                        if chunk_i == 1 or chunk_i % 24 == 0:
-                            if not enforce_cpu_safety(during_generation=True):
+        # Inject pinned / context-manager files first
+        if project_path:
+            pinned_block = ContextManager(project_path).build_context_block()
+            if pinned_block:
+                context = pinned_block
+
+        # Always load the pasted file into the LLM (so coding tasks see real code)
+        if (
+            explain_path_obj
+            and explain_path_obj.exists()
+            and explain_path_obj.is_file()
+            and not wants_project_explanation(prompt)
+            and not wants_list_files(prompt)
+            and not wants_read_file(prompt)
+            and not wants_create_file(prompt)
+        ):
+            try:
+                overview = build_path_context(explain_path_obj)
+                context = ((context + "\n\n") if context else "") + overview.context
+                sources = [{"path": p} for p in overview.files_used]
+                try:
+                    root_for_rel = Path(
+                        search_root or project_path or explain_path_obj.parent
+                    ).resolve()
+                    assist_edit_rel = str(
+                        explain_path_obj.resolve().relative_to(root_for_rel)
+                    ).replace("\\", "/")
+                except ValueError:
+                    assist_edit_rel = explain_path_obj.name
+                if project_path:
+                    try:
+                        ContextManager(project_path).add(str(explain_path_obj), pinned=True)
+                    except Exception:
+                        pass
+                st.caption(f"Using file `{explain_path_obj.name}` as context")
+            except FileNotFoundError as exc:
+                st.warning(str(exc))
+
+        # Agent mode: LangGraph multi-agent (pause after planner)
+        # Single pasted file + edit request → fast chat edit (diff) is clearer than full pipeline
+        use_fast_file_edit = bool(
+            assist_edit_rel
+            and explain_path_obj
+            and explain_path_obj.is_file()
+            and wants_code_edit(prompt)
+        )
+        if (
+            is_agent_mode(mode)
+            and wants_agent_feature(prompt)
+            and not wants_project_explanation(prompt)
+            and not use_fast_file_edit
+        ):
+            if not project_path:
+                with st.chat_message("assistant"):
+                    st.error(
+                        "Paste a project folder or file path above (or Open a project), "
+                        "then ask the agent to implement a change."
+                    )
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "**Error:** No project open for Agent mode.",
+                        "sources": [],
+                        "tool_trace": [],
+                    }
+                )
+                if session_store:
+                    persist_messages_to_session(session_store)
+                return
+            with st.chat_message("assistant"):
+                with st.spinner("LangGraph Planner agent running…"):
+                    snap = start_multi_agent(client, project_path, prompt)
+                answer = (
+                    f"**Multi-agent plan ready** (LangGraph interrupted after Planner)\n\n"
+                    f"**Summary:** {snap.get('plan_summary')}\n\n"
+                    f"**Tasks:**\n"
+                    + ("\n".join(f"- {t}" for t in (snap.get("tasks") or [])) or "- (none)")
+                    + "\n\n**Files to modify:**\n"
+                    + ("\n".join(f"- `{p}`" for p in (snap.get("files_to_modify") or [])) or "- (none)")
+                    + "\n\n**New files:**\n"
+                    + ("\n".join(f"- `{p}`" for p in (snap.get("files_to_create") or [])) or "- (none)")
+                    + "\n\nApprove in the panel above to continue "
+                    "Research → Analyzer → Coder → Reviewer → Tester → Docs → Final.\n\n"
+                    "**No files were modified.**"
+                )
+                st.markdown(answer)
+                ActivityStore(project_path).add("prompt", f"LangGraph plan: {prompt}")
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": [
+                        {"path": p}
+                        for p in list(snap.get("files_to_modify") or [])
+                        + list(snap.get("files_to_create") or [])
+                    ],
+                    "tool_trace": ["langgraph:planner"],
+                }
+            )
+            if session_store:
+                persist_messages_to_session(session_store)
+            st.rerun()
+            return
+
+        if use_fast_file_edit and is_agent_mode(mode):
+            st.caption(
+                "Single-file edit detected — using fast path (you'll Accept/Reject a diff). "
+                "For multi-file features, paste a folder and ask without a single file path."
+            )
+
+        # Smart "Where is X?" search
+        if wants_smart_where(prompt) and project_path:
+            with st.chat_message("assistant"):
+                with st.spinner("Smart search…"):
+                    result = smart_search(project_path, prompt)
+                answer = (
+                    f"{result.summary}\n\n"
+                    + ("**Symbols**\n" + "\n".join(f"- `{s}`" for s in result.symbols) + "\n\n" if result.symbols else "")
+                    + ("**Hits**\n```\n" + "\n".join(result.hits[:30]) + "\n```" if result.hits else "_No content hits._")
+                )
+                st.markdown(answer)
+                ActivityStore(project_path).add("search", prompt)
+            st.session_state.messages.append(
+                {
+                    "role": "assistant",
+                    "content": answer,
+                    "sources": [],
+                    "tool_trace": ["smart_search"],
+                }
+            )
+            if session_store:
+                persist_messages_to_session(session_store)
+            return
+
+        # Auto-search the project for "Search for X" (no Tools toggle required)
+        if wants_code_search(prompt) and not wants_project_explanation(prompt):
+            if not search_root:
+                with st.chat_message("assistant"):
+                    st.error(
+                        "Set a project folder path first (sidebar or Explain path box), "
+                        "then search again."
+                    )
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "**Error:** No project folder set for search.",
+                        "sources": [],
+                        "tool_trace": [],
+                    }
+                )
+                if session_store:
+                    persist_messages_to_session(session_store)
+                return
+            try:
+                query = extract_search_query(prompt)
+                bundle = search_project(search_root, query)
+                context = ((context + "\n\n") if context else "") + bundle.context
+                sources = [{"path": p} for p in bundle.files_used]
+                ActivityStore(search_root).add("search", query)
+                st.info(
+                    f"Searched `{search_root}` for `{bundle.query}` — "
+                    f"{bundle.hit_count} hit line(s)"
+                )
+            except Exception as exc:
+                with st.chat_message("assistant"):
+                    st.error(str(exc))
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"**Error:** {exc}",
+                        "sources": [],
+                        "tool_trace": [],
+                    }
+                )
+                if session_store:
+                    persist_messages_to_session(session_store)
+                return
+
+        # List / Read / Create against the project path (no Tools toggle required)
+        elif wants_list_files(prompt) or wants_read_file(prompt) or wants_create_file(prompt):
+            if not search_root:
+                with st.chat_message("assistant"):
+                    st.error("Set/paste a project folder path first, then try again.")
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "**Error:** No project folder set.",
+                        "sources": [],
+                        "tool_trace": [],
+                    }
+                )
+                if session_store:
+                    persist_messages_to_session(session_store)
+                return
+            try:
+                if wants_list_files(prompt):
+                    action = handle_list(search_root)
+                elif wants_create_file(prompt):
+                    action = handle_create_prepare(search_root, prompt)
+                    st.session_state.pending_create_path = (
+                        extract_file_path(prompt) or "examples/hello.py"
+                    )
+                else:
+                    action = handle_read(search_root, prompt)
+                extra = action.context
+                context = ((context + "\n\n") if context else "") + extra
+                sources = [{"path": p} for p in (action.sources or [])]
+                if action.effective_prompt:
+                    st.session_state._quick_effective_prompt = action.effective_prompt
+                if action.info:
+                    st.info(action.info)
+            except Exception as exc:
+                with st.chat_message("assistant"):
+                    st.error(str(exc))
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"**Error:** {exc}",
+                        "sources": [],
+                        "tool_trace": [],
+                    }
+                )
+                if session_store:
+                    persist_messages_to_session(session_store)
+                return
+
+        # Auto-read the pasted path for explain prompts
+        elif wants_project_explanation(prompt):
+            if not explain_target:
+                with st.chat_message("assistant"):
+                    st.error(
+                        "Paste a local folder or file path in **Explain any local folder or file**, "
+                        r"for example `G:\Projects\my-app` or `G:\Projects\my-app\main.py`."
+                    )
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": (
+                            "**Error:** No path set. Paste any local folder/file path, then click Explain."
+                        ),
+                        "sources": [],
+                        "tool_trace": [],
+                    }
+                )
+                if session_store:
+                    persist_messages_to_session(session_store)
+                return
+            try:
+                target = explain_target
+                force_folder = bool(st.session_state.pop("force_explain_folder", False))
+                # "Explain this project/folder" must always use a directory
+                prompt_l = prompt.lower()
+                if force_folder or "project" in prompt_l or "folder" in prompt_l or "structure" in prompt_l:
+                    p = Path(target)
+                    if p.is_file():
+                        target = str(p.parent)
+                    overview = build_project_overview(target)
+                else:
+                    overview = build_path_context(target)
+                extra = overview.context
+                context = ((context + "\n\n") if context else "") + extra
+                sources = [{"path": p} for p in overview.files_used]
+                kind_label = "file" if overview.kind == "file" else "folder"
+                st.info(
+                    f"Reading local {kind_label}: `{overview.project_path}` "
+                    f"({len(overview.files_used)} items in context)"
+                )
+                with st.expander("Context files loaded", expanded=True):
+                    for src in overview.files_used:
+                        st.markdown(f"- `{src}`")
+                _remember_path(overview.project_path)
+                if project_path:
+                    ActivityStore(project_path).add("file", f"Explain {overview.project_path}")
+            except FileNotFoundError as exc:
+                with st.chat_message("assistant"):
+                    st.error(str(exc))
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"**Error:** {exc}",
+                        "sources": [],
+                        "tool_trace": [],
+                    }
+                )
+                if session_store:
+                    persist_messages_to_session(session_store)
+                return
+
+        elif use_rag and project_path:
+            try:
+                rag = get_rag_settings()
+                retriever = ProjectRetriever(get_embedder(), top_k=rag["top_k"])
+                if retriever.has_index(project_path):
+                    chunks = retriever.retrieve(project_path, prompt)
+                    rag_ctx = retriever.format_context(chunks)
+                    context = ((context + "\n\n") if context else "") + rag_ctx
+                    sources = [
+                        {
+                            "path": c.path,
+                            "start_line": c.start_line,
+                            "end_line": c.end_line,
+                        }
+                        for c in chunks
+                    ]
+            except OllamaError as exc:
+                with st.chat_message("assistant"):
+                    st.error(str(exc))
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": f"**Error:** {exc}",
+                        "sources": [],
+                        "tool_trace": [],
+                    }
+                )
+                if session_store:
+                    persist_messages_to_session(session_store)
+                return
+
+        effective_prompt = prompt
+        quick_prompt = st.session_state.pop("_quick_effective_prompt", None)
+        if quick_prompt:
+            effective_prompt = quick_prompt
+        elif wants_code_search(prompt) and context:
+            effective_prompt = (
+                "Using ONLY the SEARCH HITS provided, answer where the symbol/text appears.\n"
+                "List matching file paths and briefly what each hit is.\n"
+                "If there are no hits, say it was not found in the project.\n"
+                "Do NOT say you lack project context — search results are already provided."
+            )
+        elif wants_project_explanation(prompt) and context:
+            if overview_is_file_prompt(prompt):
+                effective_prompt = (
+                    "Using ONLY the FILE CONTENTS provided, explain this code.\n"
+                    "Cover: purpose, important functions/classes, inputs/outputs, and how it fits a project.\n"
+                    "Cite the file path. Do NOT ask for more information."
+                )
+            else:
+                effective_prompt = (
+                    "Using ONLY the PROJECT CONTEXT provided, explain the WHOLE project.\n"
+                    "Do NOT write an answer that only explains package.json.\n"
+                    "Required sections:\n"
+                    "1) Overview — what the app is (e.g. React portfolio)\n"
+                    "2) Folder structure — describe src/, pages/, components/, data/, configs\n"
+                    "3) Important source files — App.jsx, main.jsx, each page/component briefly\n"
+                    "4) Data & routing — how pages are connected\n"
+                    "5) How to run — npm scripts from package.json (short)\n"
+                    "Cite real paths. Keep package.json to a few bullets only."
+                )
+        elif assist_edit_rel and context and (
+            wants_code_edit(prompt) or wants_agent_feature(prompt)
+        ):
+            # Pasted file is in context — ask for a full-file rewrite we can propose as a diff
+            effective_prompt = (
+                f"You are editing the file `{assist_edit_rel}` shown in FILE CONTENTS.\n"
+                f"User request:\n{prompt}\n\n"
+                "Reply with:\n"
+                "1) A short explanation (2-4 sentences) of what you changed\n"
+                "2) Then ONE markdown code block containing the FULL updated file contents only\n"
+                "Keep unrelated code unchanged. Do not ask questions. Do not say you lack the file."
+            )
+
+        # Optional custom system prompt from project settings is applied in build_messages
+
+        auto_fs = (
+            wants_list_files(prompt)
+            or wants_read_file(prompt)
+            or wants_create_file(prompt)
+            or wants_code_search(prompt)
+            or wants_project_explanation(prompt)
+        )
+
+        with st.chat_message("assistant"):
+            if sources:
+                with st.expander(
+                    "Files used",
+                    expanded=bool(wants_code_search(prompt) or wants_list_files(prompt) or wants_read_file(prompt)),
+                ):
+                    for src in sources:
+                        if "start_line" in src:
+                            st.markdown(
+                                f"- `{src['path']}` "
+                                f"(lines {src['start_line']}-{src['end_line']})"
+                            )
+                        else:
+                            st.markdown(f"- `{src['path']}`")
+
+            placeholder = st.empty()
+            tool_trace: list[str] = []
+            new_pending_writes = False
+            answer = ""
+
+            try:
+                run_tools = bool(
+                    use_tools
+                    and project_path
+                    and prompt_needs_tools(prompt)
+                    and not auto_fs
+                )
+
+                if run_tools:
+                    placeholder.markdown(
+                        '<span class="loading-pulse">Running tools…</span>',
+                        unsafe_allow_html=True,
+                    )
+                    agent = ToolAgent(client, FileSystemTools(project_path), max_steps=3)
+                    result = agent.run(
+                        effective_prompt,
+                        history=history,
+                        context=context or None,
+                    )
+                    if result.error:
+                        answer = f"**Error:** {result.error}"
+                    else:
+                        answer = result.answer or "(No answer produced.)"
+                    tool_trace = result.tool_trace
+                    if result.pending_writes:
+                        existing = st.session_state.get("proposed_edits") or []
+                        for pw in result.pending_writes:
+                            try:
+                                edit = build_proposed_edit(
+                                    project_path,
+                                    pw.path,
+                                    pw.content,
+                                    note="tool agent proposal",
+                                )
+                                existing.append(edit.to_dict())
+                            except Exception:
+                                existing.append(
+                                    ProposedEdit(
+                                        path=pw.path,
+                                        new_content=pw.content,
+                                        old_content=getattr(pw, "old_content", "") or "",
+                                        is_new=pw.is_new,
+                                        absolute_path=pw.absolute_path,
+                                    ).to_dict()
+                                )
+                        st.session_state.proposed_edits = existing
+                        st.session_state.pending_writes = []
+                        new_pending_writes = True
+                        if project_path:
+                            ActivityStore(project_path).add(
+                                "edit",
+                                f"Proposed {len(result.pending_writes)} write(s)",
+                            )
+                    placeholder.markdown(answer)
+                    if tool_trace:
+                        with st.expander("Tool calls", expanded=True):
+                            for line in tool_trace:
+                                st.code(line, language="text")
+                    if result.pending_writes:
+                        st.info(
+                            f"{len(result.pending_writes)} write(s) pending — "
+                            "approve or reject in the panel above."
+                        )
+                else:
+                    if use_tools and not project_path:
+                        st.warning("Set a project folder to use filesystem tools.")
+                    placeholder.markdown(
+                        '<span class="loading-pulse">Thinking…</span>',
+                        unsafe_allow_html=True,
+                    )
+                    messages = build_messages(
+                        effective_prompt,
+                        history=history,
+                        context=context or None,
+                        system_prompt=_effective_system_prompt(
+                            project_path, project_settings
+                        ),
+                    )
+                    use_stream = True
+                    if project_settings is not None:
+                        use_stream = bool(project_settings.streaming)
+                    import time as _time
+
+                    t0 = _time.perf_counter()
+                    if use_stream:
+                        collected: list[str] = []
+                        stream = client.chat(messages, stream=True)
+                        assert not isinstance(stream, str)
+                        stopped = False
+                        chunk_i = 0
+                        for chunk in stream:
+                            chunk_i += 1
+                            if chunk_i == 1 or chunk_i % 24 == 0:
+                                if not enforce_cpu_safety(during_generation=True):
+                                    stopped = True
+                                    break
+                            if st.session_state.get("stop_generation"):
                                 stopped = True
                                 break
-                        if st.session_state.get("stop_generation"):
-                            stopped = True
-                            break
-                        collected.append(chunk)
-                        placeholder.markdown("".join(collected) + "▌")
-                    answer = "".join(collected)
-                    if stopped:
-                        if st.session_state.get("cpu_safety_lock"):
-                            answer = (
-                                (answer + "\n\n") if answer else ""
-                            ) + "_🛑 Generation stopped by CPU safety guard._"
-                        else:
-                            answer = (
-                                (answer + "\n\n") if answer else ""
-                            ) + "_⏹ Generation stopped by user._"
-                        st.session_state.stop_generation = False
-                    placeholder.markdown(answer)
-                else:
-                    raw = client.chat(messages, stream=False)
-                    assert isinstance(raw, str)
-                    answer = raw
-                    placeholder.markdown(answer)
-                elapsed_ms = (_time.perf_counter() - t0) * 1000
-                if project_path:
-                    MetricsStore(project_path).record_response(
-                        effective_prompt, answer, elapsed_ms
-                    )
-                    console.add(
-                        f"Chat response {elapsed_ms:.0f}ms",
-                        source="chat",
-                        detail=f"~tokens in/out est.",
-                    )
-
-            # For create-file prompts, turn the generated code into an Approve write
-            if wants_create_file(prompt) and search_root and answer and not answer.startswith("**Error:**"):
-                rel = st.session_state.pop(
-                    "pending_create_path",
-                    extract_file_path(prompt) or "examples/hello.py",
-                )
-                pending = propose_write_from_answer(search_root, rel, answer)
-                if pending is not None:
-                    try:
-                        edit = build_proposed_edit(
-                            search_root,
-                            pending.path,
-                            pending.content,
-                            note="create file proposal",
-                        )
-                        existing = st.session_state.get("proposed_edits") or []
-                        existing.append(edit.to_dict())
-                        st.session_state.proposed_edits = existing
-                    except Exception:
-                        existing = st.session_state.get("pending_writes") or []
-                        existing.append(pending)
-                        st.session_state.pending_writes = existing
-                    new_pending_writes = True
+                            collected.append(chunk)
+                            placeholder.markdown("".join(collected) + "▌")
+                        answer = "".join(collected)
+                        if stopped:
+                            if st.session_state.get("cpu_safety_lock"):
+                                answer = (
+                                    (answer + "\n\n") if answer else ""
+                                ) + "_⏹ Stopped by CPU safety._"
+                            else:
+                                answer = (
+                                    (answer + "\n\n") if answer else ""
+                                ) + "_⏹ Generation stopped._"
+                            st.session_state.stop_generation = False
+                        placeholder.markdown(answer)
+                    else:
+                        raw = client.chat(messages, stream=False)
+                        assert isinstance(raw, str)
+                        answer = raw
+                        placeholder.markdown(answer)
+                    elapsed_ms = (_time.perf_counter() - t0) * 1000
                     if project_path:
-                        ActivityStore(project_path).add("edit", f"Proposed create {pending.path}")
-                    st.info(
-                        f"Proposed file `{pending.path}` — review Diff (Accept/Reject) above."
-                    )
-        except OllamaError as exc:
-            answer = f"**Error:** {exc}"
-            placeholder.markdown(answer)
-        except Exception as exc:
-            answer = f"**Error:** {exc}"
-            placeholder.markdown(answer)
+                        MetricsStore(project_path).record_response(
+                            effective_prompt, answer, elapsed_ms
+                        )
+                        console.add(
+                            f"Chat response {elapsed_ms:.0f}ms",
+                            source="chat",
+                            detail="~tokens in/out est.",
+                        )
 
-    st.session_state.messages.append(
-        {
-            "role": "assistant",
-            "content": answer,
-            "sources": sources,
-            "tool_trace": tool_trace,
-        }
-    )
-    if session_store:
-        persist_messages_to_session(session_store)
-    if new_pending_writes:
-        st.rerun()
+                if wants_create_file(prompt) and search_root and answer and not answer.startswith("**Error:**"):
+                    rel = st.session_state.pop(
+                        "pending_create_path",
+                        extract_file_path(prompt) or "examples/hello.py",
+                    )
+                    pending = propose_write_from_answer(search_root, rel, answer)
+                    if pending is not None:
+                        try:
+                            edit = build_proposed_edit(
+                                search_root,
+                                pending.path,
+                                pending.content,
+                                note="create file proposal",
+                            )
+                            existing = st.session_state.get("proposed_edits") or []
+                            existing.append(edit.to_dict())
+                            st.session_state.proposed_edits = existing
+                        except Exception:
+                            existing = st.session_state.get("pending_writes") or []
+                            existing.append(pending)
+                            st.session_state.pending_writes = existing
+                        new_pending_writes = True
+                        if project_path:
+                            ActivityStore(project_path).add(
+                                "edit", f"Proposed create {pending.path}"
+                            )
+                        st.info(
+                            f"Proposed file `{pending.path}` — review Diff (Accept/Reject) above."
+                        )
+                elif (
+                    assist_edit_rel
+                    and search_root
+                    and answer
+                    and not answer.startswith("**Error:**")
+                    and (wants_code_edit(prompt) or wants_agent_feature(prompt))
+                ):
+                    pending = propose_write_from_answer(
+                        search_root, assist_edit_rel, answer
+                    )
+                    if pending is not None:
+                        try:
+                            edit = build_proposed_edit(
+                                search_root,
+                                pending.path,
+                                pending.content,
+                                note=f"edit from chat: {prompt[:80]}",
+                            )
+                            existing = st.session_state.get("proposed_edits") or []
+                            existing.append(edit.to_dict())
+                            st.session_state.proposed_edits = existing
+                        except Exception:
+                            existing = st.session_state.get("pending_writes") or []
+                            existing.append(pending)
+                            st.session_state.pending_writes = existing
+                        new_pending_writes = True
+                        if project_path:
+                            ActivityStore(project_path).add(
+                                "edit", f"Proposed edit {assist_edit_rel}"
+                            )
+                        st.info(
+                            f"Proposed edit for `{assist_edit_rel}` — "
+                            "review **Diff (Accept/Reject)** above to apply it to disk."
+                        )
+                    else:
+                        st.warning(
+                            "Model reply had no code block — could not propose a file edit."
+                        )
+            except OllamaError as exc:
+                answer = f"**Error:** {exc}"
+                placeholder.markdown(answer)
+            except Exception as exc:
+                answer = f"**Error:** {exc}"
+                placeholder.markdown(answer)
+
+        st.session_state.messages.append(
+            {
+                "role": "assistant",
+                "content": answer,
+                "sources": sources,
+                "tool_trace": tool_trace,
+            }
+        )
+        if session_store:
+            persist_messages_to_session(session_store)
+        if new_pending_writes:
+            st.rerun()
+
+    finally:
+        _render_chat_input_bar()
+
 
 
 def _remember_path(path: str) -> None:

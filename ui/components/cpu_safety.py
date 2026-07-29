@@ -2,10 +2,83 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
+import psutil
 import streamlit as st
 
 from src.productivity.devlog import console
-from src.system_info import check_cpu_safety
+
+# Import from system_info when available; keep a local fallback so a stale
+# Streamlit module cache never crashes the app with ImportError.
+try:
+    from src.system_info import check_cpu_safety
+except ImportError:  # pragma: no cover
+
+    @dataclass
+    class _CpuSafetyStatus:
+        ok: bool
+        level: str
+        cpu_percent: float
+        ram_percent: float
+        message: str
+        should_stop_work: bool = False
+
+    def check_cpu_safety(  # type: ignore[misc]
+        *,
+        warn_cpu: float = 85.0,
+        critical_cpu: float = 95.0,
+        warn_ram: float = 90.0,
+        critical_ram: float = 95.0,
+        cpu_percent: float | None = None,
+        ram_percent: float | None = None,
+    ):
+        try:
+            cpu = float(
+                cpu_percent
+                if cpu_percent is not None
+                else psutil.cpu_percent(interval=0.15)
+            )
+        except Exception:
+            cpu = 0.0
+        try:
+            ram = float(
+                ram_percent
+                if ram_percent is not None
+                else psutil.virtual_memory().percent
+            )
+        except Exception:
+            ram = 0.0
+
+        if cpu >= critical_cpu or ram >= critical_ram:
+            return _CpuSafetyStatus(
+                ok=False,
+                level="critical",
+                cpu_percent=cpu,
+                ram_percent=ram,
+                message=(
+                    f"Safety stop: laptop overloaded (CPU {cpu:.0f}%, RAM {ram:.0f}%). "
+                    "AI work stopped. Close apps, then Unlock."
+                ),
+                should_stop_work=True,
+            )
+        if cpu >= warn_cpu or ram >= warn_ram:
+            return _CpuSafetyStatus(
+                ok=True,
+                level="warn",
+                cpu_percent=cpu,
+                ram_percent=ram,
+                message=f"High load (CPU {cpu:.0f}%, RAM {ram:.0f}%).",
+                should_stop_work=False,
+            )
+        return _CpuSafetyStatus(
+            ok=True,
+            level="ok",
+            cpu_percent=cpu,
+            ram_percent=ram,
+            message=f"Load OK — CPU {cpu:.0f}%, RAM {ram:.0f}%.",
+            should_stop_work=False,
+        )
 
 
 def enforce_cpu_safety(*, during_generation: bool = False) -> bool:
@@ -32,7 +105,6 @@ def enforce_cpu_safety(*, during_generation: bool = False) -> bool:
     }
 
     if status.level == "warn":
-        # Soft warning only (avoid spamming during every stream chunk)
         if not during_generation:
             st.sidebar.warning(status.message)
         return True
@@ -76,7 +148,6 @@ def render_cpu_safety_panel() -> None:
             or status.message
         )
         if st.button("Unlock AI work (load cooled down)", type="primary", key="cpu_unlock"):
-            # Re-check before unlocking
             again = check_cpu_safety()
             if again.should_stop_work:
                 st.warning(
@@ -92,7 +163,6 @@ def render_cpu_safety_panel() -> None:
         if st.button("Force quit Streamlit process", key="cpu_force_quit"):
             console.add("Force quit requested", level="warn", source="cpu_safety")
             st.warning("Stopping Streamlit for safety…")
-            # st.stop() ends this run; raising SystemExit ends the server worker.
             raise SystemExit("CPU safety force quit")
     elif status.level == "warn":
         st.warning(status.message)

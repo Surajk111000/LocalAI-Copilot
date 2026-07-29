@@ -12,7 +12,7 @@ from src.workspace.paths import read_json, settings_path, write_json
 class ProjectSettings:
     preferred_model: str = "qwen2.5-coder:3b"
     rag_enabled: bool = False
-    cpu_threads: int = 4
+    cpu_threads: int = 2  # low by default — keeps UI smoother on laptops
     temperature: float = 0.2
     top_p: float = 0.9
     context_size: int = 4096
@@ -36,7 +36,7 @@ class SettingsStore:
         return ProjectSettings(
             preferred_model=str(raw.get("preferred_model") or "qwen2.5-coder:3b"),
             rag_enabled=bool(raw.get("rag_enabled", False)),
-            cpu_threads=int(raw.get("cpu_threads") or 4),
+            cpu_threads=int(raw.get("cpu_threads") or 2),
             temperature=float(raw.get("temperature") if raw.get("temperature") is not None else 0.2),
             top_p=float(raw.get("top_p") if raw.get("top_p") is not None else 0.9),
             context_size=int(raw.get("context_size") or 4096),

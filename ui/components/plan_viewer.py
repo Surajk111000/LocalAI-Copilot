@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import streamlit as st
 
-from src.agent.planner import AgentCoder, AgentPlanner, EditPlan
+from src.agent.plan_types import EditPlan
+from src.agent.planner import AgentCoder, AgentPlanner
 from src.llm.ollama_client import OllamaClient
 
 

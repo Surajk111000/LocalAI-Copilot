@@ -25,7 +25,7 @@ def render_project_manager(wm: WorkspaceManager) -> str | None:
             try:
                 wm.open_project(path)
                 st.session_state.project_path = path
-                st.session_state.explain_path_input = path
+                st.session_state._pending_explain_path = path
                 st.session_state.explain_target_path = path
                 st.session_state._workspace_switch = True
                 st.rerun()
@@ -56,7 +56,7 @@ def render_project_manager(wm: WorkspaceManager) -> str | None:
             if not is_active:
                 wm.set_active(entry.path)
                 st.session_state.project_path = entry.path
-                st.session_state.explain_path_input = entry.path
+                st.session_state._pending_explain_path = entry.path
                 st.session_state.explain_target_path = entry.path
                 st.session_state._workspace_switch = True
                 st.rerun()
@@ -79,7 +79,7 @@ def render_project_manager(wm: WorkspaceManager) -> str | None:
                     try:
                         wm.open_project(entry.path)
                         st.session_state.project_path = entry.path
-                        st.session_state.explain_path_input = entry.path
+                        st.session_state._pending_explain_path = entry.path
                         st.session_state.explain_target_path = entry.path
                         st.session_state._workspace_switch = True
                         st.rerun()

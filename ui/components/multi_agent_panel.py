@@ -6,7 +6,7 @@ from typing import Any
 
 import streamlit as st
 
-from src.agent.planner import EditPlan
+from src.agent.plan_types import EditPlan
 from src.llm.ollama_client import OllamaClient
 from src.multi_agent.graph import MultiAgentRunner
 from src.rag.embeddings import OllamaEmbedder

@@ -45,6 +45,11 @@ div[data-testid="stChatMessage"] {
   background: linear-gradient(180deg, #238636, #1a7f37); border-color: #2ea043;
 }
 code, pre, .stCode { font-family: 'JetBrains Mono', monospace !important; }
+div[data-testid="stForm"] { border: none !important; background: transparent !important; }
+div[data-testid="stForm"] .stTextInput input {
+  border: 1px solid var(--border) !important;
+  background: var(--bg-1) !important;
+}
 </style>
 """
 
